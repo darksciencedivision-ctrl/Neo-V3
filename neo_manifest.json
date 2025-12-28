@@ -1,51 +1,33 @@
 {
-  "stack_id": "NEO-LAB-LOCAL",
-  "paths": {
-    "stack_root": "C:\\ai_control\\NEO_Stack",
-    "queue_root": "C:\\ai_control\\NEO_Stack\\queue_v2",
+  "manifest_version": "2.0",
+  "stack_id": "NEO_LAB_V2_QUEUE_V2",
+  "mode": "local",
+  "deterministic": true,
 
-    "queue_inbox": "C:\\ai_control\\NEO_Stack\\queue_v2\\inbox",
-    "queue_outbox": "C:\\ai_control\\NEO_Stack\\queue_v2\\outbox",
-    "queue_processing": "C:\\ai_control\\NEO_Stack\\queue_v2\\processing",
-    "queue_processed": "C:\\ai_control\\NEO_Stack\\queue_v2\\processed",
-    "queue_deadletter": "C:\\ai_control\\NEO_Stack\\queue_v2\\deadletter",
-
-    "kb_root": "C:\\ai_control\\NEO_Stack\\kb",
-    "artifacts_root": "C:\\ai_control\\NEO_Stack\\artifacts"
-  },
-
-  "routes": {
-    "chat": {
-      "description": "General chat / operator interface"
-    },
-    "coder": {
-      "description": "Code generation + debugging"
-    },
-    "reasoner": {
-      "description": "Deep analysis / tradeoffs / planning"
-    }
+  "ollama": {
+    "base_url": "http://127.0.0.1:11434",
+    "timeout_seconds": 180,
+    "num_predict": 256,
+    "temperature": 0.2
   },
 
   "model_map": {
     "chat": "dolphin-llama3:latest",
     "coder": "deepseek-coder-v2:latest",
-    "reasoner": "deepseek-r1:latest",
+    "reasoner": "dolphin-llama3:latest",
     "retrieval": "dolphin-llama3:latest"
   },
 
-  "models": {
-    "dolphin-llama3:latest": {
-      "provider": "ollama",
-      "context_tokens": 8192
-    },
-    "deepseek-coder-v2:latest": {
-      "provider": "ollama",
-      "context_tokens": 8192
-    },
-    "deepseek-r1:latest": {
-      "provider": "ollama",
-      "context_tokens": 8192
-    }
+  "paths": {
+    "queue_inbox": "C:\\ai_control\\NEO_Stack\\queue_v2\\inbox",
+    "queue_processing": "C:\\ai_control\\NEO_Stack\\queue_v2\\processing",
+    "queue_outbox": "C:\\ai_control\\NEO_Stack\\queue_v2\\outbox",
+    "queue_processed": "C:\\ai_control\\NEO_Stack\\queue_v2\\processed",
+    "queue_deadletter": "C:\\ai_control\\NEO_Stack\\queue_v2\\deadletter",
+
+    "kb_root": "C:\\ai_control\\NEO_Stack\\kb",
+    "artifacts_root": "C:\\ai_control\\NEO_Stack\\artifacts",
+    "log_file": "C:\\ai_control\\NEO_Stack\\artifacts\\neo_loop.log"
   }
 }
 

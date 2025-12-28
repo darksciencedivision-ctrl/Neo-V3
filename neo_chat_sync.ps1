@@ -1,164 +1,198 @@
+# C:\ai_control\NEO_Stack\neo_chat_sync.ps1
+# NEO CHAT SYNC (queue_v2) - Windows PowerShell 5.1 SAFE (ASCII)
+# Purpose:
+# - Operator CLI that writes inbound message JSON files to queue_v2\inbox
+# - Waits for reply JSON files in queue_v2\outbox
+# - Zero model logic; routing is only /chat /coder /reasoner /retrieval command prefix
+#
+# Fix in this version:
+# - Supports BOTH manifest schemas:
+#   - paths.queue_inbox / paths.queue_outbox (new)
+#   - paths.inbox / paths.outbox (legacy)
+# - Correctly tracks whether a reply was received; does NOT print timeout warning after success
+
 param(
-  [string]$ManifestPath = ".\neo_manifest.json",
-  [int]$PollMs = 250,
-  [int]$TimeoutSec = 180
+    [string]$ManifestPath = "C:\ai_control\NEO_Stack\neo_manifest.json",
+    [int]$WaitSeconds = 300,
+    [int]$PollMs = 250
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Write-Utf8NoBom($Path, $Text) {
-  $utf8 = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($Path, $Text, $utf8)
+function Read-Json {
+    param([string]$Path)
+    $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    return ($raw | ConvertFrom-Json)
 }
-function Read-Json($Path) { Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
-function New-Id { ([Guid]::NewGuid().ToString("N")) }
 
-$manifest = Read-Json (Resolve-Path $ManifestPath)
-$INBOX  = $manifest.paths.queue_inbox
-$OUTBOX = $manifest.paths.queue_outbox
-$ART    = $manifest.paths.artifacts_root
+function Write-JsonUtf8NoBom {
+    param([string]$Path, [object]$Obj)
+    $json = $Obj | ConvertTo-Json -Depth 25
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $json, $enc)
+}
 
-New-Item -ItemType Directory -Force -Path $INBOX,$OUTBOX,$ART | Out-Null
+function Ensure-Dir {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path | Out-Null
+    }
+}
 
-$global:CurrentRoute = "chat"
+function Now-UTC {
+    (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+}
+
+function New-StableId {
+    param([string]$Prefix = "msg")
+    $ts = (Get-Date).ToString("yyyyMMdd_HHmmss_fff")
+    $rand = [Guid]::NewGuid().ToString("N").Substring(0,12)
+    return ("{0}_{1}_{2}" -f $Prefix, $ts, $rand)
+}
+
+function Get-PathValue {
+    param([object]$Manifest, [string]$Key)
+    try {
+        if ($Manifest -and $Manifest.paths) {
+            $p = $Manifest.paths
+            $v = $p.PSObject.Properties[$Key]
+            if ($v -and $v.Value) { return [string]$v.Value }
+        }
+    } catch { }
+    return ""
+}
+
+function Resolve-QueuePaths {
+    param([object]$Manifest)
+
+    $inbox  = Get-PathValue -Manifest $Manifest -Key "queue_inbox"
+    $outbox = Get-PathValue -Manifest $Manifest -Key "queue_outbox"
+
+    if ([string]::IsNullOrWhiteSpace($inbox))  { $inbox  = Get-PathValue -Manifest $Manifest -Key "inbox" }
+    if ([string]::IsNullOrWhiteSpace($outbox)) { $outbox = Get-PathValue -Manifest $Manifest -Key "outbox" }
+
+    if ([string]::IsNullOrWhiteSpace($inbox))  { $inbox  = "C:\ai_control\NEO_Stack\queue_v2\inbox" }
+    if ([string]::IsNullOrWhiteSpace($outbox)) { $outbox = "C:\ai_control\NEO_Stack\queue_v2\outbox" }
+
+    return @($inbox, $outbox)
+}
+
+# ---- Load manifest
+if (-not (Test-Path -LiteralPath $ManifestPath)) {
+    throw ("Manifest not found: {0}" -f $ManifestPath)
+}
+$manifest = Read-Json -Path $ManifestPath
+
+# ---- Resolve queue paths
+$paths = Resolve-QueuePaths -Manifest $manifest
+$INBOX  = $paths[0]
+$OUTBOX = $paths[1]
+
+Ensure-Dir $INBOX
+Ensure-Dir $OUTBOX
 
 Write-Host "NEO CHAT SYNC (queue_v2)"
-Write-Host "INBOX:  $INBOX"
-Write-Host "OUTBOX: $OUTBOX"
-Write-Host "Commands: /exit /help  |  /chat /coder /reasoner"
-Write-Host ""
+Write-Host ("INBOX:  {0}" -f $INBOX)
+Write-Host ("OUTBOX: {0}" -f $OUTBOX)
+Write-Host "Commands: /exit /help | /chat /coder /reasoner /retrieval"
 
-function Extract-Text($j) {
-  foreach ($k in @("text","reply","content","output","message")) {
-    if ($j.PSObject.Properties.Name -contains $k) {
-      $v = $j.$k
-      if ($null -ne $v -and "$v".Trim().Length -gt 0) { return "$v" }
-    }
-  }
-  return $null
-}
-
-function Find-ReplyForRequest([string]$RequestId) {
-  $files = Get-ChildItem -LiteralPath $OUTBOX -File -ErrorAction SilentlyContinue |
-           Sort-Object LastWriteTime  # oldest->newest
-
-  foreach ($f in $files) {
-    try {
-      $j = Read-Json $f.FullName
-
-      # Preferred correlation keys you already have in your outbox:
-      foreach ($k in @("in_reply_to","request_id","req_id","parent_id")) {
-        if ($j.PSObject.Properties.Name -contains $k) {
-          if ("$($j.$k)" -eq $RequestId) { return $j }
-        }
-      }
-
-      # Fallback: sometimes the reply id embeds the msg id
-      if ($j.PSObject.Properties.Name -contains "id") {
-        if ("$($j.id)" -match [Regex]::Escape($RequestId)) { return $j }
-      }
-    } catch {
-      # If JSON parse fails, ignore
-    }
-  }
-
-  return $null
-}
-
-function Get-NewestReply {
-  $f = Get-ChildItem -LiteralPath $OUTBOX -File -ErrorAction SilentlyContinue |
-       Sort-Object LastWriteTime -Desc | Select-Object -First 1
-  if (-not $f) { return $null }
-  try { return (Read-Json $f.FullName) } catch { return $null }
-}
-
-function Set-Route([string]$r) {
-  $r = $r.ToLowerInvariant()
-  $valid = $manifest.routes.PSObject.Properties.Name
-  if ($valid -notcontains $r) { throw "Unknown route '$r'. Valid: $($valid -join ', ')" }
-  $global:CurrentRoute = $r
-  Write-Host "ROUTE SET: $global:CurrentRoute"
-}
+$route = "chat"
 
 while ($true) {
-  $user = Read-Host "YOU"
-  if ($null -eq $user) { continue }
+    $line = Read-Host "YOU"
+    if ($null -eq $line) { continue }
+    $t = [string]$line
 
-  $trim = ($user -replace "^\s+|\s+$","")
-  if ($trim.Length -eq 0) { continue }
+    if ($t.Trim().Length -eq 0) { continue }
 
-  if ($trim -match '^\s*YOU:\s*') {
-    Write-Host "NEO: (input error) Do not type 'YOU:'. Type only the message."
-    continue
-  }
-
-  if ($trim -match '\/(chat|coder|reasoner)\s+\S') {
-    Write-Host "NEO: (input error) Route switches must be on their own line: /chat or /coder or /reasoner"
-    continue
-  }
-
-  switch ($trim.ToLowerInvariant()) {
-    "/exit" { break }
-    "/help" {
-      Write-Host "Use /chat /coder /reasoner on their own line."
-      Write-Host "Then type ONE prompt per message."
-      Write-Host "Current route: $global:CurrentRoute"
-      continue
+    if ($t -ieq "/exit") { break }
+    if ($t -ieq "/help") {
+        Write-Host "Commands: /exit /help | /chat /coder /reasoner /retrieval"
+        Write-Host "Tip: Prefix with /chat etc, or set route then type message."
+        continue
     }
-    "/chat"     { Set-Route "chat"; continue }
-    "/coder"    { Set-Route "coder"; continue }
-    "/reasoner" { Set-Route "reasoner"; continue }
-  }
 
-  $id = New-Id
-  $payload = [ordered]@{
-    id        = $id
-    msg_id    = $id
-    ts_utc    = [DateTime]::UtcNow.ToString("o")
-    role      = "user"
-    route     = $global:CurrentRoute
-    user_text = $trim
-    text      = $trim
-    prompt    = $trim
-    stack_id  = $manifest.stack_id
-  }
-
-  $json = $payload | ConvertTo-Json -Depth 10
-  Write-Utf8NoBom (Join-Path $ART "last_inbox_written.json") $json
-
-  $tmp = Join-Path $INBOX "msg_$id.json.tmp"
-  $dst = Join-Path $INBOX "msg_$id.json"
-  Write-Utf8NoBom $tmp $json
-  Move-Item -LiteralPath $tmp -Destination $dst -Force
-
-  $deadline = (Get-Date).AddSeconds($TimeoutSec)
-  $reply = $null
-
-  while ((Get-Date) -lt $deadline) {
-    $reply = Find-ReplyForRequest $id
-    if ($reply) { break }
-    Start-Sleep -Milliseconds $PollMs
-  }
-
-  if (-not $reply) {
-    Write-Host "NEO:"
-    Write-Host "WARNING: (no reply found yet - timeout after $TimeoutSec s)"
-    $newest = Get-NewestReply
-    if ($newest) {
-      $t = Extract-Text $newest
-      if ($t) { Write-Host "(newest outbox) $t" }
-      else { Write-Host "(newest outbox raw)"; ($newest | ConvertTo-Json -Depth 10) }
-    } else {
-      Write-Host "(outbox is empty/unreadable)"
+    if ($t.StartsWith("/chat", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $route = "chat"
+        $rest = ($t -replace '^\s*/chat\s*', '')
+        Write-Host "ROUTE SET: chat"
+        if ($rest.Trim().Length -eq 0) { continue }
+        $t = $rest
     }
-    continue
-  }
+    elseif ($t.StartsWith("/coder", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $route = "coder"
+        $rest = ($t -replace '^\s*/coder\s*', '')
+        Write-Host "ROUTE SET: coder"
+        if ($rest.Trim().Length -eq 0) { continue }
+        $t = $rest
+    }
+    elseif ($t.StartsWith("/reasoner", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $route = "reasoner"
+        $rest = ($t -replace '^\s*/reasoner\s*', '')
+        Write-Host "ROUTE SET: reasoner"
+        if ($rest.Trim().Length -eq 0) { continue }
+        $t = $rest
+    }
+    elseif ($t.StartsWith("/retrieval", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $route = "retrieval"
+        $rest = ($t -replace '^\s*/retrieval\s*', '')
+        Write-Host "ROUTE SET: retrieval"
+        if ($rest.Trim().Length -eq 0) { continue }
+        $t = $rest
+    }
 
-  $txt = Extract-Text $reply
-  if ($txt) { Write-Host "NEO: $txt"; continue }
+    $id = New-StableId -Prefix "msg"
+    $msgObj = [ordered]@{
+        id     = $id
+        ts_utc = (Now-UTC)
+        route  = $route
+        text   = $t
+    }
 
-  Write-Host "NEO: (raw)"
-  ($reply | ConvertTo-Json -Depth 10)
+    $msgName = ("{0}.json" -f $id)
+    $msgPath = Join-Path $INBOX $msgName
+    Write-JsonUtf8NoBom -Path $msgPath -Obj $msgObj
+
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $replyPath = Join-Path $OUTBOX ("reply_{0}.json" -f $id)
+
+    $gotReply = $false
+
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $replyPath) {
+            try {
+                $reply = Read-Json -Path $replyPath
+
+                if ($reply -and ($reply.ok -eq $false) -and $reply.error) {
+                    Write-Host ("ERROR: {0}" -f [string]$reply.error)
+                }
+
+                if ($reply -and $reply.text) {
+                    Write-Host ("NEO: {0}" -f [string]$reply.text)
+                } else {
+                    if ($reply -and ($reply.ok -eq $true)) {
+                        Write-Host "NEO: (empty reply)"
+                    }
+                }
+
+                Remove-Item -LiteralPath $replyPath -Force -ErrorAction SilentlyContinue
+                $gotReply = $true
+                break
+            } catch {
+                Write-Host ("WARN: reply read failed: {0}" -f $_.Exception.Message)
+                Start-Sleep -Milliseconds $PollMs
+                continue
+            }
+        }
+        Start-Sleep -Milliseconds $PollMs
+    }
+
+    if (-not $gotReply) {
+        Write-Host ("WARNING: (no reply found yet - timeout after {0} s)" -f $WaitSeconds)
+    }
 }
+
+Write-Host "EXIT"
 

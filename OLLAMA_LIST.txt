@@ -1,0 +1,6 @@
+﻿NAME                        ID              SIZE      MODIFIED    
+qwen2.5vl:7b                5ced39dfa4ba    6.0 GB    13 days ago    
+deepseek-r1:latest          6995872bfe4c    5.2 GB    13 days ago    
+deepseek-coder-v2:latest    63fb193b3a9b    8.9 GB    13 days ago    
+qwen3:8b                    500a1f067a9f    5.2 GB    13 days ago    
+dolphin-llama3:latest       613f068e29f8    4.7 GB    3 weeks ago    

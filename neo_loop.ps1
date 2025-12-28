@@ -1,13 +1,10 @@
-# ============================================================
-# NEO LOOP - Manifest Driven Deterministic Runtime (queue_v2)
-# Windows PowerShell 5.1 - ASCII ONLY
-#
-# Stop mechanism:
-#   Create:  C:\ai_control\NEO_Stack\artifacts\STOP
-# ============================================================
+# C:\ai_control\NEO_Stack\neo_loop.ps1
+# NEO LOOP - MANIFEST DRIVEN (queue_v2) - Windows PowerShell 5.1 SAFE (ASCII)
 
 param(
     [string]$ManifestPath = "C:\ai_control\NEO_Stack\neo_manifest.json",
+    [int]$PollMs = 250,
+    [int]$IdleSleepMs = 250,
     [switch]$Quiet,
     [ValidateSet("INFO","WARN","ERROR")]
     [string]$LogLevel = "INFO"
@@ -16,387 +13,474 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ------------------------------------------------------------
+# ============================
+# Constants
+# ============================
+$script:NEO_ROOT = "C:\ai_control\NEO_Stack"
+$script:ADAPTER_PATH = "C:\ai_control\NEO_Stack\adapters\ollama_http.ps1"
+
+$script:SELFREAD_MAX_BYTES_DEFAULT = 131072   # 128 KB
+$script:SELFREAD_MAX_BYTES_HARDCAP = 524288   # 512 KB
+
+# ============================
 # Utilities
-# ------------------------------------------------------------
+# ============================
 function Ensure-Dir {
-    param([string]$Path)
+    param([Parameter(Mandatory=$true)][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path | Out-Null
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
-}
-
-function Write-Utf8NoBom {
-    param([string]$Path, [string]$Text)
-    $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($Path, $Text, $utf8)
 }
 
 function Write-Log {
     param(
-        [string]$LogPath,
-        [string]$Level,
-        [string]$Message,
-        [hashtable]$Data = $null
+        [Parameter(Mandatory=$true)][ValidateSet("INFO","WARN","ERROR")][string]$Level,
+        [Parameter(Mandatory=$true)][string]$Message
     )
+    $order = @{ "INFO"=0; "WARN"=1; "ERROR"=2 }
+    if ($order[$Level] -lt $order[$LogLevel]) { return }
 
-    $rank = @{ INFO=1; WARN=2; ERROR=3 }
-    if (-not $rank.ContainsKey($Level)) { $Level = "INFO" }
-    if (-not $rank.ContainsKey($LogLevel)) { $LogLevel = "INFO" }
-    if ($rank[$Level] -lt $rank[$LogLevel]) { return }
-
-    $obj = @{
-        ts_utc = (Get-Date).ToUniversalTime().ToString("o")
-        level  = $Level
-        msg    = $Message
-    }
-    if ($Data) { $obj.data = $Data }
-
-    $line = ($obj | ConvertTo-Json -Depth 12 -Compress)
-
-    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
-        Ensure-Dir (Split-Path -Parent $LogPath)
-        Add-Content -LiteralPath $LogPath -Value $line
-    }
-
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+    $line = "[$ts][$Level] $Message"
     if (-not $Quiet) { Write-Host $line }
+    if ($script:LogFile) {
+        try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 } catch { }
+    }
+}
+
+function Safe-Text {
+    param([object]$v)
+    if ($null -eq $v) { return "" }
+    return [string]$v
+}
+
+function Get-PropValue {
+    param(
+        [Parameter(Mandatory=$true)][object]$Obj,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($null -eq $p) { return $null }
+    return $p.Value
 }
 
 function Read-JsonFile {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw ("JSON file not found: " + $Path)
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "JSON_NOT_FOUND: $Path" }
+    $raw = Get-Content -LiteralPath $Path -Raw
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw "JSON_EMPTY: $Path" }
+    try { return ($raw | ConvertFrom-Json) } catch { throw "JSON_PARSE_ERROR: $Path :: $($_.Exception.Message)" }
+}
+
+function Write-JsonFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)]$Object
+    )
+    $json = $Object | ConvertTo-Json -Depth 12
+    Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+}
+
+function New-GuidNoHyphen { return ([Guid]::NewGuid().ToString("N")) }
+function Get-NowUtcIso { return ([DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")) }
+
+function Move-Atomic {
+    param([Parameter(Mandatory=$true)][string]$From, [Parameter(Mandatory=$true)][string]$To)
+    Move-Item -LiteralPath $From -Destination $To -Force
+}
+
+# ============================
+# Adapter Load (SCRIPT SCOPE)
+# ============================
+if (-not (Test-Path -LiteralPath $script:ADAPTER_PATH)) {
+    throw "ADAPTER_NOT_FOUND: $script:ADAPTER_PATH"
+}
+
+# Dot-source at script scope so Invoke-OllamaGenerate persists
+. $script:ADAPTER_PATH
+
+if (-not (Get-Command -Name Invoke-OllamaGenerate -ErrorAction SilentlyContinue)) {
+    throw "ADAPTER_INVALID: Invoke-OllamaGenerate not found after dot-sourcing $script:ADAPTER_PATH"
+}
+
+function Reload-AdapterIfMissing {
+    if (-not (Get-Command -Name Invoke-OllamaGenerate -ErrorAction SilentlyContinue)) {
+        . $script:ADAPTER_PATH
+        if (-not (Get-Command -Name Invoke-OllamaGenerate -ErrorAction SilentlyContinue)) {
+            throw "ADAPTER_INVALID: Invoke-OllamaGenerate missing even after reload"
+        }
     }
+}
+
+# ============================
+# Controlled Self-Read
+# ============================
+function Read-SafeTextFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][string]$RelativePath,
+        [int]$MaxBytes
+    )
+
+    if ($null -eq $MaxBytes -or $MaxBytes -le 0) { $MaxBytes = 65536 }
+    if ($MaxBytes -gt $script:SELFREAD_MAX_BYTES_HARDCAP) {
+        throw "SELFREAD_DENIED: MaxBytes exceeds hard cap ($script:SELFREAD_MAX_BYTES_HARDCAP)"
+    }
+
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $target   = [IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
+
+    if (-not $target.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "SELFREAD_DENIED: Path escapes root. rel='$RelativePath'"
+    }
+
+    $ext = [IO.Path]::GetExtension($target).ToLowerInvariant()
+    $allowed = @(".ps1",".json",".md",".txt",".log")
+    if ($allowed -notcontains $ext) { throw "SELFREAD_DENIED: Extension not allowed: $ext" }
+    if (-not (Test-Path -LiteralPath $target)) { throw "SELFREAD_NOTFOUND: $RelativePath" }
+
+    $fi = Get-Item -LiteralPath $target
+    if ($fi.Length -gt $MaxBytes) {
+        throw ("SELFREAD_TOO_LARGE: {0} bytes={1} max={2}" -f $RelativePath, $fi.Length, $MaxBytes)
+    }
+
+    return (Get-Content -LiteralPath $target -Raw)
+}
+
+# ============================
+# Manifest Validate
+# ============================
+function Validate-Manifest {
+    param([Parameter(Mandatory=$true)]$m)
+
+    $paths = Get-PropValue -Obj $m -Name "paths"
+    if ($null -eq $paths) { throw "MANIFEST_INVALID: missing paths" }
+
+    foreach ($k in @(
+        "queue_inbox","queue_processing","queue_outbox","queue_processed","queue_deadletter",
+        "kb_root","artifacts_root","log_file"
+    )) {
+        $v = Get-PropValue -Obj $paths -Name $k
+        if ($null -eq $v -or [string]::IsNullOrWhiteSpace([string]$v)) {
+            throw "MANIFEST_INVALID: missing/empty paths.$k"
+        }
+    }
+
+    $modelMap = Get-PropValue -Obj $m -Name "model_map"
+    if ($null -eq $modelMap) { throw "MANIFEST_INVALID: missing model_map" }
+
+    foreach ($r in @("chat","coder","reasoner","retrieval")) {
+        $mv = Get-PropValue -Obj $modelMap -Name $r
+        if ($null -eq $mv -or [string]::IsNullOrWhiteSpace([string]$mv)) {
+            throw "MANIFEST_INVALID: missing/empty model_map.$r"
+        }
+    }
+
+    $oll = Get-PropValue -Obj $m -Name "ollama"
+    if ($null -eq $oll) { throw "MANIFEST_INVALID: missing ollama" }
+
+    $bu = Get-PropValue -Obj $oll -Name "base_url"
+    if ($null -eq $bu -or [string]::IsNullOrWhiteSpace([string]$bu)) {
+        throw "MANIFEST_INVALID: missing/empty ollama.base_url"
+    }
+}
+
+# ============================
+# Message Helpers
+# ============================
+function Normalize-Route {
+    param([string]$Route)
+    $r = (Safe-Text $Route).Trim().ToLowerInvariant()
+    switch ($r) {
+        "" { "chat" }
+        "analysis" { "reasoner" }
+        "reason" { "reasoner" }
+        "/chat" { "chat" }
+        "/coder" { "coder" }
+        "/reasoner" { "reasoner" }
+        "/retrieval" { "retrieval" }
+        "chat" { "chat" }
+        "coder" { "coder" }
+        "reasoner" { "reasoner" }
+        "retrieval" { "retrieval" }
+        default { $r }
+    }
+}
+
+function Validate-Message {
+    param([Parameter(Mandatory=$true)]$msg)
+
+    $idv = Get-PropValue -Obj $msg -Name "id"
+    if ($null -eq $idv -or [string]::IsNullOrWhiteSpace([string]$idv)) {
+        throw "MSG_INVALID: missing id"
+    }
+
+    $t = Get-PropValue -Obj $msg -Name "user_text"
+    if ($null -eq $t) { $t = Get-PropValue -Obj $msg -Name "userText" }
+    if ($null -eq $t) { $t = Get-PropValue -Obj $msg -Name "text" }
+    if ($null -eq $t) { $t = Get-PropValue -Obj $msg -Name "message" }
+
+    if ($null -eq $t -or [string]::IsNullOrWhiteSpace([string]$t)) {
+        throw "MSG_INVALID: missing user_text/userText/text/message"
+    }
+
+    $msg | Add-Member -NotePropertyName "_userText" -NotePropertyValue (Safe-Text $t) -Force
+
+    $routeRaw = Get-PropValue -Obj $msg -Name "route"
+    if ($null -eq $routeRaw) { $routeRaw = Get-PropValue -Obj $msg -Name "mode" }
+
+    $norm = Normalize-Route (Safe-Text $routeRaw)
+    if ($norm -notin @("chat","coder","reasoner","retrieval")) {
+        throw "MSG_INVALID: invalid route '$norm'"
+    }
+
+    $msg | Add-Member -NotePropertyName "_route" -NotePropertyValue $norm -Force
+}
+
+function Build-SystemPreamble {
+@"
+You are NEO-LAB, a local, offline, file-governed assistant invoked through a deterministic control plane.
+You do not have OS access. You only know what the operator provides in the prompt.
+Never claim you can see files unless the content is included.
+"@
+}
+
+function Build-Prompt {
+    param(
+        [Parameter(Mandatory=$true)][string]$UserText,
+        [Parameter(Mandatory=$true)][string]$Route,
+        [Parameter(Mandatory=$true)][string]$StackPreamble
+    )
+
+    $roleInstr = switch ($Route) {
+        "coder" { "Role: CODE. Produce correct code and file edits. Prefer PowerShell 5.1 compatibility." }
+        "reasoner" { "Role: ANALYSIS. Explain architecture, diagnose issues, propose tests and improvements." }
+        "retrieval" { "Role: RETRIEVAL. Use only provided context; if insufficient, request specific file names or data." }
+        default { "Role: CHAT. Be concise and helpful." }
+    }
+
+@"
+$StackPreamble
+
+$roleInstr
+
+USER:
+$UserText
+"@
+}
+
+function Deadletter {
+    param(
+        [Parameter(Mandatory=$true)][string]$DeadDir,
+        [Parameter(Mandatory=$true)][string]$MsgPath,
+        [Parameter(Mandatory=$true)][string]$ErrorText
+    )
+
+    Ensure-Dir $DeadDir
+
+    $base = Split-Path -Leaf $MsgPath
+    $dst  = Join-Path $DeadDir $base
+
     try {
-        $raw = Get-Content -LiteralPath $Path -Raw
-        if ([string]::IsNullOrWhiteSpace($raw)) { throw ("Empty JSON file: " + $Path) }
-        return ($raw | ConvertFrom-Json)
+        if (Test-Path -LiteralPath $MsgPath) { Move-Atomic -From $MsgPath -To $dst }
     } catch {
-        throw ("Invalid JSON in file: " + $Path + " -- " + $_.Exception.Message)
+        try { Copy-Item -LiteralPath $MsgPath -Destination $dst -Force } catch { }
+        try { Remove-Item -LiteralPath $MsgPath -Force -ErrorAction SilentlyContinue } catch { }
     }
+
+    $exPath = ($dst + ".exception")
+    try { Set-Content -LiteralPath $exPath -Value $ErrorText -Encoding UTF8 } catch { }
+
+    Write-Log -Level "ERROR" -Message ("DEADLETTER: {0} :: {1}" -f $base, $ErrorText)
 }
 
-function Has-Prop {
-    param($Obj, [string]$Name)
-    if ($null -eq $Obj) { return $false }
-    return ($Obj.PSObject.Properties.Name -contains $Name)
-}
-
-function Normalize-Text {
-    param([string]$Text)
-    if ($null -eq $Text) { $Text = "" }
-    return $Text.Trim()
-}
-
-# ------------------------------------------------------------
-# Routing
-# ------------------------------------------------------------
-function Decide-Route {
-    param([string]$Text, $Routes)
-
-    $t = Normalize-Text $Text
-    $route = "chat"
-    $conf  = 0.5
-    $clean = $t
-
-    # Hard switches (must be alone on their line in neo_chat_sync.ps1)
-    if ($t.StartsWith("/chat", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $route = "chat"; $conf = 0.95
-        $clean = $t.Substring(5).Trim()
-        return @{ route=$route; confidence=$conf; text=$clean }
-    }
-    if ($t.StartsWith("/coder", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $route = "coder"; $conf = 0.95
-        $clean = $t.Substring(6).Trim()
-        return @{ route=$route; confidence=$conf; text=$clean }
-    }
-    if ($t.StartsWith("/reasoner", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $route = "reasoner"; $conf = 0.95
-        $clean = $t.Substring(10).Trim()
-        return @{ route=$route; confidence=$conf; text=$clean }
-    }
-    if ($t.StartsWith("/retrieval", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $route = "retrieval"; $conf = 0.90
-        $clean = $t.Substring(10).Trim()
-        return @{ route=$route; confidence=$conf; text=$clean }
-    }
-    if ($t.StartsWith("/r", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $route = "retrieval"; $conf = 0.80
-        $clean = $t.Substring(2).Trim()
-        return @{ route=$route; confidence=$conf; text=$clean }
-    }
-
-    # Rule-based routing (optional)
-    if ($null -ne $Routes -and (Has-Prop $Routes "rules")) {
-        foreach ($r in $Routes.rules) {
-            $match = ""
-            $value = ""
-            $rte   = ""
-            if (Has-Prop $r "match") { $match = [string]$r.match }
-            if (Has-Prop $r "value") { $value = [string]$r.value }
-            if (Has-Prop $r "route") { $rte   = [string]$r.route }
-
-            if ([string]::IsNullOrWhiteSpace($value)) { continue }
-            if ([string]::IsNullOrWhiteSpace($rte)) { continue }
-
-            if ($match -eq "starts_with") {
-                if ($t.StartsWith($value, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    return @{ route=$rte; confidence=0.70; text=$t }
-                }
-            } elseif ($match -eq "contains") {
-                if ($t.IndexOf($value, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    return @{ route=$rte; confidence=0.70; text=$t }
-                }
-            }
-        }
-    }
-
-    return @{ route=$route; confidence=$conf; text=$clean }
-}
-
-# ------------------------------------------------------------
-# Retrieval (simple Select-String)
-# ------------------------------------------------------------
-function Invoke-Retrieve {
-    param([string]$Query, [string]$KbRoot, [int]$MaxHits = 10)
-
-    $hits = @()
-    if ([string]::IsNullOrWhiteSpace($KbRoot)) { return @{ engine="none"; hits=@() } }
-    if (-not (Test-Path -LiteralPath $KbRoot)) { return @{ engine="none"; hits=@() } }
-
-    try {
-        $results = Select-String -Path (Join-Path $KbRoot "*") -Pattern $Query -SimpleMatch -Recurse -ErrorAction SilentlyContinue
-        foreach ($m in $results) {
-            $hits += @{ path=[string]$m.Path; line=[int]$m.LineNumber; text=[string]$m.Line }
-            if ($hits.Count -ge $MaxHits) { break }
-        }
-    } catch { }
-
-    return @{ engine="select-string"; hits=$hits }
-}
-
-# ------------------------------------------------------------
-# Ollama Invocation
-# ------------------------------------------------------------
-function Invoke-Ollama {
-    param([string]$Model, [string]$Prompt)
-
-    if ([string]::IsNullOrWhiteSpace($Model)) { throw "No model selected" }
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "ollama"
-    $psi.Arguments = ("run " + $Model + " --nowordwrap")
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-
-    $p = New-Object System.Diagnostics.Process
-    $p.StartInfo = $psi
-    $null = $p.Start()
-
-    $p.StandardInput.WriteLine($Prompt)
-    $p.StandardInput.Close()
-
-    $out = $p.StandardOutput.ReadToEnd()
-    $err = $p.StandardError.ReadToEnd()
-    $p.WaitForExit()
-
-    if ($p.ExitCode -ne 0) { throw ("ollama failed: " + $err) }
-    return $out.Trim()
-}
-
-# ------------------------------------------------------------
-# Load Manifest + Validate
-# ------------------------------------------------------------
+# ============================
+# Main
+# ============================
 $manifest = Read-JsonFile -Path $ManifestPath
+Validate-Manifest -m $manifest
 
-foreach ($k in @("stack_id","paths","routes","models")) {
-    if (-not (Has-Prop $manifest $k)) {
-        throw ("MANIFEST VALIDATION FAILED - missing key: " + $k)
-    }
-}
+$paths = Get-PropValue -Obj $manifest -Name "paths"
 
-$stackId = [string]$manifest.stack_id
-$paths   = $manifest.paths
-$routes  = $manifest.routes
-$models  = $manifest.models
+$inbox      = [string](Get-PropValue -Obj $paths -Name "queue_inbox")
+$processing = [string](Get-PropValue -Obj $paths -Name "queue_processing")
+$outbox     = [string](Get-PropValue -Obj $paths -Name "queue_outbox")
+$processed  = [string](Get-PropValue -Obj $paths -Name "queue_processed")
+$deadletter = [string](Get-PropValue -Obj $paths -Name "queue_deadletter")
 
-foreach ($k in @("queue_inbox","queue_outbox","queue_processing","queue_processed","queue_deadletter","kb_root","artifacts_root")) {
-    if (-not (Has-Prop $paths $k)) { throw ("MANIFEST missing paths." + $k) }
-}
+$kbRoot     = [string](Get-PropValue -Obj $paths -Name "kb_root")
+$artRoot    = [string](Get-PropValue -Obj $paths -Name "artifacts_root")
+$script:LogFile = [string](Get-PropValue -Obj $paths -Name "log_file")
 
-$INBOX      = [string]$paths.queue_inbox
-$OUTBOX     = [string]$paths.queue_outbox
-$PROCESSING = [string]$paths.queue_processing
-$PROCESSED  = [string]$paths.queue_processed
-$DLQ        = [string]$paths.queue_deadletter
-$KBROOT     = [string]$paths.kb_root
-$ART        = [string]$paths.artifacts_root
+Ensure-Dir $inbox; Ensure-Dir $processing; Ensure-Dir $outbox; Ensure-Dir $processed; Ensure-Dir $deadletter
+Ensure-Dir $kbRoot; Ensure-Dir $artRoot
 
-Ensure-Dir $INBOX
-Ensure-Dir $OUTBOX
-Ensure-Dir $PROCESSING
-Ensure-Dir $PROCESSED
-Ensure-Dir $DLQ
-Ensure-Dir $ART
+$stopFile = Join-Path $artRoot "STOP"
 
-$STOPFILE = Join-Path $ART "STOP"
-$LOGPATH  = Join-Path (Join-Path $ART "logs") "neo_loop.log"
+$oll = Get-PropValue -Obj $manifest -Name "ollama"
+$baseUrl = [string](Get-PropValue -Obj $oll -Name "base_url")
+$modelMap = Get-PropValue -Obj $manifest -Name "model_map"
 
-Write-Log -LogPath $LOGPATH -Level "INFO" -Message ("NEO LOOP START (" + $stackId + ")") -Data @{
-    inbox=$INBOX; outbox=$OUTBOX; dlq=$DLQ
-}
+Write-Log -Level "INFO" -Message ("NEO LOOP START :: manifest={0}" -f $ManifestPath)
+Write-Log -Level "INFO" -Message ("INBOX={0}" -f $inbox)
+Write-Log -Level "INFO" -Message ("OUTBOX={0}" -f $outbox)
+Write-Log -Level "INFO" -Message ("ADAPTER={0}" -f $script:ADAPTER_PATH)
+Write-Log -Level "INFO" -Message ("SELFREAD_MAX_BYTES_DEFAULT={0} HARD_CAP={1}" -f $script:SELFREAD_MAX_BYTES_DEFAULT, $script:SELFREAD_MAX_BYTES_HARDCAP)
 
-# ------------------------------------------------------------
-# Loop
-# ------------------------------------------------------------
 while ($true) {
 
-    # Clean stop (no Ctrl+C required)
-    if (Test-Path -LiteralPath $STOPFILE) {
-        Write-Log -LogPath $LOGPATH -Level "WARN" -Message "STOP FILE DETECTED - shutting down"
+    if (Test-Path -LiteralPath $stopFile) {
+        Write-Log -Level "WARN" -Message "STOP file detected. Exiting cleanly."
         break
     }
 
-    $next = Get-ChildItem -LiteralPath $INBOX -Filter "*.json" -File -ErrorAction SilentlyContinue |
+    $next = Get-ChildItem -LiteralPath $inbox -File -Filter "*.json" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime |
         Select-Object -First 1
 
     if (-not $next) {
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Milliseconds $IdleSleepMs
         continue
     }
 
-    $inPath   = $next.FullName
-    $workPath = Join-Path $PROCESSING $next.Name
+    $msgFile  = $next.FullName
+    $procFile = Join-Path $processing ($next.Name)
+
+    try { Move-Atomic -From $msgFile -To $procFile }
+    catch { Start-Sleep -Milliseconds $PollMs; continue }
 
     try {
-        Move-Item -LiteralPath $inPath -Destination $workPath -Force
+        $msg = Read-JsonFile -Path $procFile
+        Validate-Message -msg $msg
 
-        $msg = Read-JsonFile -Path $workPath
+        $id       = Safe-Text (Get-PropValue -Obj $msg -Name "id")
+        $userText = Safe-Text (Get-PropValue -Obj $msg -Name "_userText")
+        $route    = Safe-Text (Get-PropValue -Obj $msg -Name "_route")
 
-        if (-not (Has-Prop $msg "id"))   { throw "Inbound message missing: id" }
-        if (-not (Has-Prop $msg "text")) { throw "Inbound message missing: text" }
+        $model = Safe-Text (Get-PropValue -Obj $modelMap -Name $route)
+        if ([string]::IsNullOrWhiteSpace($model)) { throw "MODEL_MAP_MISSING: route=$route" }
 
-        $id   = [string]$msg.id
-        $role = "user"
-        if (Has-Prop $msg "role") { $role = [string]$msg.role }
+        $preamble = Build-SystemPreamble
+        $prompt   = Build-Prompt -UserText $userText -Route $route -StackPreamble $preamble
 
-        $text = [string]$msg.text
-        $pick = Decide-Route -Text $text -Routes $routes
-        $route     = [string]$pick.route
-        $routeConf = [double]$pick.confidence
-        $cleanText = [string]$pick.text
+        # /self
+        if ($userText -match '^\s*/self\s+(.+?)(?:\s+(\d+))?\s*$') {
+            $rel = $Matches[1].Trim()
+            $reqMax = $Matches[2]
 
-        # Model selection priority:
-        # 1) routes.model_map[route]
-        # 2) models[route].name
-        # 3) models.chat.name
-        $modelName = $null
-        if (Has-Prop $routes "model_map") {
-            $mm = $routes.model_map
-            if ($null -ne $mm -and ($mm.PSObject.Properties.Name -contains $route)) {
-                $modelName = [string]$mm.$route
+            if ($rel -match '^[A-Za-z]:\\' -or $rel -match '^\\') {
+                throw "SELFREAD_DENIED: Absolute paths not allowed."
+            }
+
+            $maxBytes = $script:SELFREAD_MAX_BYTES_DEFAULT
+            if (-not [string]::IsNullOrWhiteSpace($reqMax)) { $maxBytes = [int]$reqMax }
+
+            $content = Read-SafeTextFile -Root $script:NEO_ROOT -RelativePath $rel -MaxBytes $maxBytes
+
+            $prompt = @"
+You are NEO-LAB running in analysis mode. The operator explicitly provided internal system file content.
+
+FILE: $rel
+MAX_BYTES: $maxBytes
+================ BEGIN FILE ================
+$content
+================= END FILE =================
+
+TASK:
+1) Explain what this file does
+2) Describe its role in the NEO architecture
+3) Identify risks/bugs (be specific)
+4) Propose concrete improvements (patches/instructions; do NOT auto-modify)
+"@
+            $route = "reasoner"
+            $model = Safe-Text (Get-PropValue -Obj $modelMap -Name $route)
+        }
+
+        # Ensure adapter still exists (script scope reload)
+        Reload-AdapterIfMissing
+
+        $timeout = 120
+        $numPredict = 512
+        $temp = 0.2
+
+        $t2 = Get-PropValue -Obj $oll -Name "timeout_seconds"
+        $n2 = Get-PropValue -Obj $oll -Name "num_predict"
+        $p2 = Get-PropValue -Obj $oll -Name "temperature"
+        if ($null -ne $t2) { $timeout = [int]$t2 }
+        if ($null -ne $n2) { $numPredict = [int]$n2 }
+        if ($null -ne $p2) { $temp = [double]$p2 }
+
+        Write-Log -Level "INFO" -Message ("PROCESS id={0} route={1} model={2}" -f $id, $route, $model)
+
+        $raw = Invoke-OllamaGenerate -BaseUrl $baseUrl -Model $model -Prompt $prompt -TimeoutSeconds $timeout -NumPredict $numPredict -Temperature $temp
+
+        # --- Extract clean assistant text from adapter result (prevents huge JSON/context spam) ---
+        $text = ""
+
+        if ($null -eq $raw) {
+            $text = ""
+        }
+        elseif ($raw -is [string]) {
+            $text = [string]$raw
+        }
+        else {
+            # Prefer adapter's clean 'text' field
+            $pText = $raw.PSObject.Properties["text"]
+            if ($pText -and -not [string]::IsNullOrWhiteSpace([string]$pText.Value)) {
+                $text = [string]$pText.Value
+            }
+            else {
+                # Fallback: raw JSON -> response
+                $pRaw = $raw.PSObject.Properties["raw"]
+                if ($pRaw -and -not [string]::IsNullOrWhiteSpace([string]$pRaw.Value)) {
+                    try {
+                        $rawObj = $pRaw.Value | ConvertFrom-Json
+                        if ($rawObj.PSObject.Properties["response"]) {
+                            $text = [string]$rawObj.response
+                        }
+                    } catch { }
+                }
+
+                # Final fallback: response field
+                if ([string]::IsNullOrWhiteSpace($text)) {
+                    $pResp = $raw.PSObject.Properties["response"]
+                    if ($pResp) { $text = [string]$pResp.Value }
+                }
             }
         }
-        if ([string]::IsNullOrWhiteSpace($modelName)) {
-            if ($models.PSObject.Properties.Name -contains $route) {
-                $mobj = $models.$route
-                if (Has-Prop $mobj "name") { $modelName = [string]$mobj.name }
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($modelName)) {
-            if ($models.PSObject.Properties.Name -contains "chat") {
-                $mchat = $models.chat
-                if (Has-Prop $mchat "name") { $modelName = [string]$mchat.name }
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($modelName)) { $modelName = "dolphin-llama3:latest" }
 
-        # Retrieval decision
-        $useRetrieval = $false
-        $maxHits = 10
-        if (Has-Prop $manifest "retrieval") {
-            $ret = $manifest.retrieval
-            if (Has-Prop $ret "use")      { $useRetrieval = [bool]$ret.use }
-            if (Has-Prop $ret "max_hits") { $maxHits = [int]$ret.max_hits }
-        }
-        if ($route -eq "retrieval") { $useRetrieval = $true }
+        $text = ($text | Out-String).Trim()
+        # -------------------------------------------------------------------------------
 
-        $retBundle = @{ engine="none"; hits=@() }
-        if ($useRetrieval) {
-            $retBundle = Invoke-Retrieve -Query $cleanText -KbRoot $KBROOT -MaxHits $maxHits
-        }
-
-        # Prompt
-        $promptLines = New-Object System.Collections.Generic.List[string]
-        $promptLines.Add("ROUTE: " + $route) | Out-Null
-        $promptLines.Add("USER(" + $role + "): " + $cleanText) | Out-Null
-
-        if ($retBundle.hits -and $retBundle.hits.Count -gt 0) {
-            $promptLines.Add("") | Out-Null
-            $promptLines.Add("CONTEXT (search hits):") | Out-Null
-            foreach ($h in $retBundle.hits) {
-                $promptLines.Add("- " + $h.path + ":" + $h.line + " " + $h.text) | Out-Null
-            }
-        }
-
-        $promptLines.Add("") | Out-Null
-        $promptLines.Add("ASSISTANT:") | Out-Null
-        $prompt = ($promptLines -join "`n")
-
-        $assistantText = ""
-        $err = $null
-        try {
-            $assistantText = Invoke-Ollama -Model $modelName -Prompt $prompt
-        } catch {
-            $err = $_.Exception.Message
-            $assistantText = ""
-        }
-
-        $reply = @{
-            id = ("reply_" + $id)
+        $reply = [ordered]@{
+            id          = ("reply_" + (New-GuidNoHyphen))
             in_reply_to = $id
-            ts = (Get-Date).ToUniversalTime().ToString("o")
-            role = "assistant"
-            model = $modelName
-            text = $assistantText
-            error = ($err -ne $null)
-            error_code = ""
-            error_detail = $err
-            route = $route
-            route_confidence = $routeConf
-            context = @{
-                used_retrieval = $useRetrieval
-                retrieval_engine = [string]$retBundle.engine
-                hits = $retBundle.hits
-            }
+            created_utc = (Get-NowUtcIso)
+            route       = $route
+            model       = $model
+            ok          = $true
+            text        = $text
         }
 
-        $outName = ("reply_" + $id + ".json")
-        $outPath = Join-Path $OUTBOX $outName
-        Write-Utf8NoBom -Path $outPath -Text ($reply | ConvertTo-Json -Depth 12)
+        $replyName = ("reply_{0}.json" -f $id)
+        $replyPath = Join-Path $outbox $replyName
+        Write-JsonFile -Path $replyPath -Object $reply
 
-        Move-Item -LiteralPath $workPath -Destination (Join-Path $PROCESSED $next.Name) -Force
+        $donePath = Join-Path $processed ($next.Name)
+        Move-Atomic -From $procFile -To $donePath
 
-        Write-Log -LogPath $LOGPATH -Level "INFO" -Message "OK" -Data @{
-            id=$id; route=$route; retrieval=$useRetrieval; model=$modelName
-        }
-
-    } catch {
-        Write-Log -LogPath $LOGPATH -Level "ERROR" -Message "MESSAGE_FAILED" -Data @{
-            path=$workPath; err=$_.Exception.Message
-        }
-        try {
-            Ensure-Dir $DLQ
-            if (Test-Path -LiteralPath $workPath) {
-                Move-Item -LiteralPath $workPath -Destination (Join-Path $DLQ $next.Name) -Force
-            }
-        } catch { }
+        Write-Log -Level "INFO" -Message ("OK id={0} -> {1}" -f $id, $replyName)
     }
+    catch {
+        $err = $_.Exception.Message
+        $detail = $err
+        if ($_.Exception.StackTrace) { $detail = ($detail + "`n" + $_.Exception.StackTrace) }
+        Deadletter -DeadDir $deadletter -MsgPath $procFile -ErrorText $detail
+    }
+
+    Start-Sleep -Milliseconds $PollMs
 }
 
-Write-Log -LogPath $LOGPATH -Level "INFO" -Message "NEO LOOP EXITED CLEANLY"
+Write-Log -Level "INFO" -Message "NEO LOOP STOP"
+

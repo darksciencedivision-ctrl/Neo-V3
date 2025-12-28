@@ -1,0 +1,6 @@
+{
+    "db_path":  "C:\\ai_control\\NEO_Stack\\modules\\data\\neo.db.json",
+    "max_workers":  2,
+    "node_name":  "DESKTOP-03PTABH",
+    "mode":  "local"
+}
