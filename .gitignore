@@ -1,64 +1,23 @@
-﻿# Runtime queues/state
+# Runtime queue state — never commit live queue/memory files
+queue/
 queue_v2/
-artifacts/logs/
-artifacts/STOP
+*.NEOLAB_BACKUP
+*_BACKUP
+neo_queue.txt
+user_task_queue.txt
+memory_*.json
 
-# Local artifacts
+# Duplicates / scratch
+*.yml.txt
+SNAPSHOT_*.txt
+
+# Logs and outputs
+logs/
+output/
 *.log
-*.tmp
 
-# Secrets / local overrides
-neo_manifest.local.json
-.env
-*.key
-*.pem
-
-# Common caches
-__pycache__/
-.venv/
-node_modules/
+# OS / editor
 .DS_Store
 Thumbs.db
-
-# Runtime/state (do not commit)
-queue_v2/
-queue/
-runs/
-artifacts/
-artifacts/logs/
-artifacts/STOP
-
-# Secrets/keys (do not commit)
-keys/
-keys_retired/
-*.pem
-*.key
-*.pfx
-*.p12
-*.xml
-.env
-neo_manifest.local.json
-
-# Common junk
-*.log
-*.tmp
-__pycache__/
-.venv/
-node_modules/
-# Runtime/state (do not commit)
-queue_v2/
-queue/
-runs/
-artifacts/
-artifacts/logs/
-artifacts/STOP
-
-# Backup junk
-*.BACKUP*
-*BROKEN*
-*PRE_ARCH*
-
-# Logs/zips
-*.log
-*.zip
-*.tmp
+.vscode/
+.idea/
